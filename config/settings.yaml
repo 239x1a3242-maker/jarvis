@@ -1,0 +1,28 @@
+assistant:
+  name: "JARVIS"
+  version: "0.1.0"
+
+llm:
+  model_name: "microsoft/Phi-3.5-mini-instruct"
+  local_path: "./models/phi3_5_mini"
+  max_tokens: 8192
+  temperature: 0.7
+
+memory:
+  short_term_limit: 100
+  long_term_db: "c:/Users/gajja/Documents/itca/jar/jarvis/memory/long_term.db"
+  vector_store: "c:/Users/gajja/Documents/itca/jar/jarvis/memory/vector_store"
+
+interfaces:
+  text:
+    enabled: true
+  voice:
+    enabled: true
+
+tools:
+  enabled: ["system_commands", "file_manager", "web_automation"]
+
+logging:
+  level: "INFO"
+  file: "c:/Users/gajja/Documents/itca/jar/jarvis/logs/jarvis.log"
+
