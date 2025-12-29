@@ -1,0 +1,16 @@
+transformers
+torch
+accelerate
+chromadb
+pyyaml
+pyttsx3
+speechrecognition
+pyaudio
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+asyncio-mqtt>=0.13.0
+pydantic>=2.5.0
+playwright>=1.40.0
