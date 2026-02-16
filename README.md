@@ -43,25 +43,37 @@ The following mermaid flow illustrates the canonical end-to-end path (the orches
 
 ```mermaid
 flowchart TD
-flowchart TD
   User[User Query]
-  Intent[IntentParsingAgent]\n(parse -> JSON)
-  Meta[MetaControllerAgent]\n(select route)
-  Plan[PlanningAgent]\n(plan steps)
+
+  Intent[IntentParsingAgent<br>(parse → JSON)]
+  Meta[MetaControllerAgent<br>(select route)]
+  Plan[PlanningAgent<br>(plan steps)]
+
   ParallelGroup{Parallel Analysis?}
+
   Tool[ToolUseAgent]
   ReAct[ReActAgent]
   Blackboard[BlackboardAgent]
   PEV[PEVAgent]
   Ensemble[EnsembleAgent]
-  Synth[SynthesisEngine]\n(synthesize final answer)
-  Memory[EpisodicSemanticAgent]\n(save)
+
+  Synth[SynthesisEngine<br>(synthesize final answer)]
+  Reflexive[ReflexiveMetacognitiveAgent]
+  Memory[EpisodicSemanticAgent<br>(save)]
+
   User --> Intent --> Meta --> Plan --> ParallelGroup
-  ParallelGroup -->|yes| Tool & ReAct & Ensemble & Graph
+
+  ParallelGroup -->|yes| Tool
+  ParallelGroup -->|yes| ReAct
+  ParallelGroup -->|yes| Ensemble
+
   ParallelGroup -->|no| Tool --> ReAct
+
   ReAct --> Blackboard --> PEV --> Synth
   Ensemble --> Synth
-  Synth --> Reflexive[ReflexiveMetacognitiveAgent] --> Memory --> User
+
+  Synth --> Reflexive --> Memory --> User
+
 ```
 
 **Agent responsibilities and outputs (concise)**
@@ -271,4 +283,5 @@ Notes on safety and personality:
 ---
 
 If you want, I can expand these examples into unit tests (input → expected ctx state and final_answer assertions) or add canned safety templates for emotion responses. Which would you like next?
+
 
