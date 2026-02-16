@@ -4,7 +4,9 @@ import argparse
 import json
 import os
 import re
+import threading
 import time
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -108,14 +110,19 @@ class AgentContext:
     executed_stages: List[str] = field(default_factory=list)
     skipped_stages: List[str] = field(default_factory=list)
     trace: List[str] = field(default_factory=list)
+    fallback_events: List[Dict[str, str]] = field(default_factory=list)
+
+    # Lock to protect concurrent mutations when running parallel stages
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def post(self, sender: str, recipient: str, content: str) -> None:
         msg = Message(time.time(), sender, recipient, content)
-        self.messages.append(msg)
-        self.blackboard["messages"].append(
-            {"ts": round(msg.timestamp, 3), "from": sender, "to": recipient, "content": content}
-        )
-        self.trace.append(f"{sender} -> {recipient}: {content[:180]}")
+        with self.lock:
+            self.messages.append(msg)
+            self.blackboard["messages"].append(
+                {"ts": round(msg.timestamp, 3), "from": sender, "to": recipient, "content": content}
+            )
+            self.trace.append(f"{sender} -> {recipient}: {content[:180]}")
 
 
 def _to_bool(value: str) -> bool:
@@ -145,23 +152,384 @@ def _extract_steps(plan: str) -> List[str]:
     return steps[:12]
 
 
-def _first_json(text: str) -> Optional[Any]:
-    text = (text or "").strip()
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
+def _strip_code_fence(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return cleaned
+    fence = re.search(r"```(?:json)?\s*(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if fence:
+        return fence.group(1).strip()
+    return cleaned
+
+
+def _balanced_json_slices(text: str) -> List[str]:
+    candidates: List[str] = []
+    source = text or ""
+    if not source:
+        return candidates
+
     for left, right in (("{", "}"), ("[", "]")):
-        s = text.find(left)
-        e = text.rfind(right)
-        if s != -1 and e != -1 and e > s:
-            try:
-                return json.loads(text[s : e + 1])
-            except Exception:
-                continue
+        starts = [i for i, ch in enumerate(source) if ch == left][:24]
+        for start in starts:
+            depth = 0
+            in_string = False
+            escaped = False
+            for idx in range(start, len(source)):
+                ch = source[idx]
+                if escaped:
+                    escaped = False
+                    continue
+                if ch == "\\" and in_string:
+                    escaped = True
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == left:
+                    depth += 1
+                elif ch == right:
+                    depth -= 1
+                    if depth == 0:
+                        candidate = source[start : idx + 1].strip()
+                        if candidate:
+                            candidates.append(candidate)
+                        break
+    return candidates
+
+
+def _first_json(text: str, component: str = "JSONParser", verbose: bool = True) -> Optional[Any]:
+    raw = (text or "").strip()
+    if not raw:
+        _log("DEBUG", "JSONParser", f"{component}: empty response; JSON parse skipped.", verbose)
+        return None
+
+    candidates: List[Tuple[str, str]] = [("direct", raw)]
+
+    stripped = _strip_code_fence(raw)
+    if stripped != raw:
+        candidates.append(("code_fence", stripped))
+
+    for candidate in _balanced_json_slices(raw):
+        candidates.append(("balanced_slice", candidate))
+
+    seen = set()
+    for parse_mode, candidate in candidates:
+        key = (parse_mode, candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            payload = json.loads(candidate)
+            if parse_mode != "direct":
+                _log("WARN", "JSONParser", f"{component}: JSON parsed via {parse_mode} fallback.", verbose)
+            else:
+                _log("DEBUG", "JSONParser", f"{component}: JSON parsed directly.", verbose)
+            return payload
+        except Exception:
+            continue
+
+    _log("WARN", "JSONParser", f"{component}: failed to parse valid JSON payload.", verbose)
     return None
+
+
+def _record_fallback(ctx: AgentContext, component: str, reason: str) -> None:
+    safe_reason = (reason or "Unspecified fallback reason").strip()
+    event = {"component": component, "reason": safe_reason[:400], "time": str(time.time())}
+    duplicate = any(
+        item.get("component") == event["component"] and item.get("reason") == event["reason"]
+        for item in ctx.fallback_events[-8:]
+    )
+    if duplicate:
+        return
+    ctx.fallback_events.append(event)
+    ctx.blackboard["artifacts"].setdefault("fallback_events", []).append(event)
+    ctx.warnings.append(f"{component} fallback: {safe_reason[:220]}")
+
+
+class ModelSchemaAdapter:
+    @staticmethod
+    def extract_text(response: Any) -> str:
+        if response is None:
+            return ""
+        if isinstance(response, str):
+            return response
+        if isinstance(response, bytes):
+            return response.decode("utf-8", errors="ignore")
+        if isinstance(response, dict):
+            for key in ("generated_text", "output_text", "text", "content", "response", "answer"):
+                value = response.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+            if "message" in response:
+                nested = ModelSchemaAdapter.extract_text(response.get("message"))
+                if nested.strip():
+                    return nested
+            if "choices" in response and isinstance(response.get("choices"), list) and response["choices"]:
+                nested = ModelSchemaAdapter.extract_text(response["choices"][0])
+                if nested.strip():
+                    return nested
+            if "delta" in response:
+                nested = ModelSchemaAdapter.extract_text(response.get("delta"))
+                if nested.strip():
+                    return nested
+            return ""
+        if isinstance(response, list):
+            for item in response:
+                nested = ModelSchemaAdapter.extract_text(item)
+                if nested.strip():
+                    return nested
+            return ""
+
+        if hasattr(response, "model_dump"):
+            dumped = response.model_dump()
+            return ModelSchemaAdapter.extract_text(dumped)
+        if hasattr(response, "dict"):
+            try:
+                dumped = response.dict()
+                return ModelSchemaAdapter.extract_text(dumped)
+            except Exception:
+                pass
+        if hasattr(response, "choices"):
+            try:
+                choices = getattr(response, "choices")
+                if choices:
+                    return ModelSchemaAdapter.extract_text(choices[0])
+            except Exception:
+                pass
+        if hasattr(response, "message"):
+            try:
+                return ModelSchemaAdapter.extract_text(getattr(response, "message"))
+            except Exception:
+                pass
+        if hasattr(response, "content"):
+            try:
+                content = getattr(response, "content")
+                if isinstance(content, str):
+                    return content
+            except Exception:
+                pass
+        return str(response)
+
+    @staticmethod
+    def validate_intent_payload(payload: Any) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+        required = [
+            "primary_task",
+            "secondary_tasks",
+            "task_probabilities",
+            "intent_tags",
+            "detected_capabilities",
+            "entities",
+            "urgency",
+            "ambiguity_score",
+            "requires_clarification",
+            "missing_information",
+            "clarification_questions",
+            "reasoning_summary",
+        ]
+        issues: List[str] = []
+        if not isinstance(payload, dict):
+            return None, ["Payload is not a JSON object."]
+
+        missing = [key for key in required if key not in payload]
+        if missing:
+            issues.append(f"Missing required keys: {', '.join(missing)}")
+
+        primary_task = str(payload.get("primary_task", "")).strip()
+        if primary_task not in TAG_PRIORITY:
+            issues.append("primary_task is missing or outside allowed taxonomy.")
+
+        secondary_raw = payload.get("secondary_tasks")
+        if not isinstance(secondary_raw, list):
+            issues.append("secondary_tasks must be a JSON array.")
+        else:
+            for item in secondary_raw:
+                if not isinstance(item, str):
+                    issues.append("secondary_tasks must contain strings only.")
+                    break
+
+        probabilities_raw = payload.get("task_probabilities")
+        probabilities: Dict[str, float] = {}
+        if not isinstance(probabilities_raw, dict):
+            issues.append("task_probabilities must be a JSON object.")
+        else:
+            valid_probability_items = 0
+            for key, value in probabilities_raw.items():
+                if key not in TAG_PRIORITY:
+                    continue
+                try:
+                    probabilities[key] = max(0.0, float(value))
+                    valid_probability_items += 1
+                except Exception:
+                    issues.append(f"task_probabilities[{key}] must be numeric.")
+            if valid_probability_items == 0:
+                issues.append("task_probabilities does not include any valid taxonomy scores.")
+
+        intent_tags_raw = payload.get("intent_tags")
+        if not isinstance(intent_tags_raw, list):
+            issues.append("intent_tags must be a JSON array.")
+            intent_tags: List[str] = []
+        else:
+            intent_tags = [str(item).strip() for item in intent_tags_raw if str(item).strip()]
+
+        detected_raw = payload.get("detected_capabilities")
+        if not isinstance(detected_raw, list):
+            issues.append("detected_capabilities must be a JSON array.")
+            detected: List[str] = []
+        else:
+            detected = [str(item).strip() for item in detected_raw if str(item).strip()]
+
+        entities_raw = payload.get("entities")
+        entities: List[Dict[str, str]] = []
+        if not isinstance(entities_raw, list):
+            issues.append("entities must be a JSON array.")
+        else:
+            for entity in entities_raw:
+                if isinstance(entity, dict):
+                    value = str(entity.get("value", "")).strip()
+                    if not value:
+                        continue
+                    entities.append({"type": str(entity.get("type", "entity")).strip() or "entity", "value": value})
+                elif isinstance(entity, str):
+                    value = entity.strip()
+                    if value:
+                        entities.append({"type": "entity", "value": value})
+                else:
+                    issues.append("entities must contain strings or {type,value} objects.")
+                    break
+
+        urgency = str(payload.get("urgency", "")).strip().lower()
+        if urgency not in {"low", "medium", "high"}:
+            issues.append("urgency must be one of: low, medium, high.")
+
+        try:
+            ambiguity_score = float(payload.get("ambiguity_score", 0.0))
+            ambiguity_score = max(0.0, min(1.0, ambiguity_score))
+        except Exception:
+            issues.append("ambiguity_score must be numeric in range [0,1].")
+            ambiguity_score = 0.0
+
+        requires_clarification = payload.get("requires_clarification")
+        if not isinstance(requires_clarification, bool):
+            issues.append("requires_clarification must be boolean.")
+            requires_clarification = False
+
+        missing_information_raw = payload.get("missing_information")
+        if not isinstance(missing_information_raw, list):
+            issues.append("missing_information must be a JSON array.")
+            missing_information: List[str] = []
+        else:
+            missing_information = [str(item).strip() for item in missing_information_raw if str(item).strip()]
+
+        clarification_raw = payload.get("clarification_questions")
+        if not isinstance(clarification_raw, list):
+            issues.append("clarification_questions must be a JSON array.")
+            clarification_questions: List[str] = []
+        else:
+            clarification_questions = [str(item).strip() for item in clarification_raw if str(item).strip()]
+
+        reasoning_summary = payload.get("reasoning_summary")
+        if not isinstance(reasoning_summary, str):
+            issues.append("reasoning_summary must be a string.")
+            reasoning_summary = ""
+
+        if issues:
+            return None, issues
+
+        normalized_probabilities = {tag: float(probabilities.get(tag, 0.0)) for tag in TAG_PRIORITY}
+        total = sum(normalized_probabilities.values())
+        if total > 0:
+            normalized_probabilities = {key: value / total for key, value in normalized_probabilities.items()}
+
+        normalized = {
+            "primary_task": primary_task,
+            "secondary_tasks": [item for item in [str(v).strip() for v in secondary_raw] if item][:5],
+            "task_probabilities": normalized_probabilities,
+            "intent_tags": intent_tags[:8],
+            "detected_capabilities": detected[:12],
+            "entities": entities[:12],
+            "urgency": urgency,
+            "ambiguity_score": round(ambiguity_score, 3),
+            "requires_clarification": requires_clarification,
+            "missing_information": missing_information[:8],
+            "clarification_questions": clarification_questions[:6],
+            "reasoning_summary": reasoning_summary[:400],
+        }
+        return normalized, []
+
+    @staticmethod
+    def validate_react_payload(payload: Any) -> Tuple[Optional[Dict[str, str]], List[str]]:
+        issues: List[str] = []
+        if not isinstance(payload, dict):
+            return None, ["Payload is not a JSON object."]
+
+        required = ["action", "action_input", "rationale"]
+        missing = [key for key in required if key not in payload]
+        if missing:
+            issues.append(f"Missing required keys: {', '.join(missing)}")
+
+        action = str(payload.get("action", "")).strip().lower()
+        if action not in {"search", "scrape", "note", "finish"}:
+            issues.append("action must be one of: search, scrape, note, finish.")
+
+        action_input = payload.get("action_input", "")
+        rationale = payload.get("rationale", "")
+        if not isinstance(action_input, str):
+            issues.append("action_input must be a string.")
+        if not isinstance(rationale, str):
+            issues.append("rationale must be a string.")
+
+        if issues:
+            return None, issues
+
+        normalized = {
+            "action": action,
+            "action_input": action_input.strip(),
+            "rationale": rationale.strip(),
+        }
+        return normalized, []
+
+    @staticmethod
+    def validate_tot_payload(payload: Any) -> Tuple[Optional[List[Dict[str, Any]]], List[str]]:
+        issues: List[str] = []
+        candidates: List[Any]
+        if isinstance(payload, list):
+            candidates = payload
+        elif isinstance(payload, dict):
+            candidates = payload.get("branches", [])
+            if not isinstance(candidates, list):
+                return None, ["branches must be a JSON array when payload is object."]
+        else:
+            return None, ["Payload must be JSON array or object with branches."]
+
+        normalized: List[Dict[str, Any]] = []
+        for idx, item in enumerate(candidates):
+            if not isinstance(item, dict):
+                issues.append(f"branch[{idx}] must be a JSON object.")
+                continue
+            approach = str(item.get("approach", "")).strip()
+            if not approach:
+                issues.append(f"branch[{idx}].approach is required.")
+            try:
+                score = float(item.get("score", 0.0))
+            except Exception:
+                issues.append(f"branch[{idx}].score must be numeric.")
+                score = 0.0
+            risk = str(item.get("risk", "medium")).strip().lower()
+            if risk not in {"low", "medium", "high"}:
+                risk = "medium"
+            normalized.append(
+                {"approach": approach[:220], "score": max(0.0, min(1.0, score)), "risk": risk}
+            )
+
+        normalized = [item for item in normalized if item.get("approach")]
+        if not normalized:
+            issues.append("No valid branches available after validation.")
+
+        if issues:
+            return None, issues
+        return normalized[:8], []
 
 
 def _dedupe_sources(sources: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -1681,15 +2049,48 @@ class AdvancedAutoBotArchitecture:
         if not stages:
             return results
 
+        # Run each stage using a deepcopy of the context to avoid race
+        # conditions when agents mutate shared structures. Merge results
+        # back under ctx.lock after each stage completes.
+        def _run_wrapper(stage_name: str, fn: Callable[[], None]):
+            local_ctx = deepcopy(ctx)
+            try:
+                ok = self._run_stage(local_ctx, stage_name, fn, False)
+            except Exception:
+                ok = False
+            return stage_name, local_ctx, bool(ok)
+
         with ThreadPoolExecutor(max_workers=len(stages)) as executor:
             future_map = {
-                executor.submit(self._run_stage, ctx, stage_name, fn, False): stage_name
+                executor.submit(_run_wrapper, stage_name, fn): stage_name
                 for stage_name, fn in stages
             }
             for future in as_completed(future_map):
                 stage_name = future_map[future]
                 try:
-                    results[stage_name] = bool(future.result())
+                    stage_name, local_ctx, ok = future.result()
+                    results[stage_name] = bool(ok)
+                    # merge safe things back into the main ctx
+                    with ctx.lock:
+                        ctx.messages.extend(local_ctx.messages)
+                        ctx.warnings.extend(local_ctx.warnings)
+                        ctx.errors.extend(local_ctx.errors)
+                        ctx.observations.extend(local_ctx.observations)
+                        ctx.fallback_events.extend(local_ctx.fallback_events)
+                        ctx.executed_stages.extend(local_ctx.executed_stages)
+                        ctx.skipped_stages.extend(local_ctx.skipped_stages)
+                        ctx.blackboard.setdefault("artifacts", {}).update(
+                            local_ctx.blackboard.get("artifacts", {})
+                        )
+                        ctx.blackboard.setdefault("status", {}).update(
+                            local_ctx.blackboard.get("status", {})
+                        )
+                        ctx.blackboard.setdefault("messages", []).extend(
+                            local_ctx.blackboard.get("messages", [])
+                        )
+                        if not ctx.plan and getattr(local_ctx, "plan", ""):
+                            ctx.plan = local_ctx.plan
+                            ctx.plan_steps = local_ctx.plan_steps
                 except Exception as exc:
                     self._record_error(ctx, f"{stage_name}.parallel", exc)
                     results[stage_name] = False

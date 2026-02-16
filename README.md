@@ -36,110 +36,44 @@ It uses the requested LiquidAI models by default:
 - tool usage is integrated with iterative reasoning,
 - safety and verification layers gate output quality,
 - memory accumulates across runs,
-- final output includes confidence and validation metadata.
 
-## Adaptive Execution (Critical Behavior)
+# Advanced AutoBot Architecture
 
-The architecture is **not a fixed mandatory pipeline** for every query.
+This folder contains the main orchestration implementation: `architecture.py`.
 
-For each task, it first builds an `execution_profile` from:
+This implementation is an advanced, multi-agent, task-driven architecture combining a broad set of agentic patterns:
 
-- task category (`general_qa`, `data_gathering`, `analysis`, `code_generation`, `debugging`, `workflow_automation`, `verification`, `decision_making`, `prediction_forecasting`, `learning_adaptation`, `collaboration`, `negotiation`, `tool_use`)
-- estimated complexity (`simple`, `medium`, `hard`)
-- depth (`low`, `medium`, `high`)
+- Tool use and web retrieval
+- The ReAct reasoning+action loop
+- Planning and goal decomposition
+- Multi-agent coordination with a shared blackboard
+- PEV (Plan → Execute → Verify) verification loop
+- Episodic + semantic memory
+- Tree-of-Thoughts exploration
+- Mental-loop simulation and dry-run safety checks
+- Ensemble reasoning and RLHF-style local refinement
+- Cellular-automata-based prioritization
+- Reflexive metacognitive confidence assessment
 
-Then it selectively runs only required agents. Example:
+Default models (configurable via environment variables):
 
-- simple QA: minimal flow (plan + synthesize + confidence)
-- medium tasks: selective reasoning + verification agents
-- hard tasks: full flow, including retry loops and optional parallel branches
+- `PLANNING_MODEL` (default: `LiquidAI/LFM2.5-1.2B-Instruct`)
+- `RAG_MODEL` (default: `LiquidAI/LFM2-1.2B-RAG`)
+- `THINKING_MODEL` (default: `LiquidAI/LFM2.5-1.2B-Thinking`)
 
-Parallel processing is used on hard tasks for independent analysis branches (Graph + Ensemble).
-Clarification mode is automatically triggered for underspecified/ambiguous requests.
+## Quick summary
 
-## Intent Identification (Semantic, Not Keyword-Only)
+`architecture.py` is a single-file, self-contained orchestrator that:
 
-Task identification is now driven by a semantic intent layer before routing:
+- Parses the user's intent into a probabilistic task taxonomy
+- Builds an adaptive `execution_profile` (which stages to run)
+- Optionally retrieves external evidence and runs iterative ReAct loops
+- Performs verification (PEV), risk simulation, and final synthesis
+- Persists episode summaries and semantic facts to `autobot_memory.json`
 
-1. Context Window Analysis:
-- loads episodic memory first (`EpisodicSemanticAgent.recall.context`) and injects prior relevant runs into intent parsing.
+## Flowchart (Mermaid)
 
-2. Semantic Intent Parsing:
-- `IntentParsingAgent` requests structured JSON from the thinking model with:
-  - primary task,
-  - secondary tasks,
-  - task probability distribution,
-  - entities,
-  - ambiguity score,
-  - clarification requirements.
-
-3. Probabilistic Classification:
-- routing uses `task_probabilities` and confidence gaps, not direct hardcoded keyword branches.
-
-4. Entity + Requirement Extraction:
-- captures extracted entities and missing-information signals to support decomposition and planning.
-
-5. Ambiguity Handling:
-- if uncertainty is high or the query is underspecified, the system enters clarification mode and asks targeted questions before executing a full pipeline.
-
-6. Fallback Safety:
-- if model intent JSON is unavailable/invalid, a semantic similarity fallback inference runs.
-- this fallback is still probability-based and multi-signal; it is not a single `if keyword then task` rule.
-
-## Capability Coverage Matrix
-
-The architecture now includes a capability catalog and intent-tag router, so it is not limited to only a few task types.
-
-Detected intent tags include:
-
-- `general_qa`
-- `data_gathering`
-- `analysis`
-- `code_generation`
-- `debugging`
-- `workflow_automation`
-- `verification`
-- `decision_making`
-- `prediction_forecasting`
-- `learning_adaptation`
-- `collaboration`
-- `negotiation`
-- `tool_use`
-
-Capability groups covered by routing and adaptive stage selection:
-
-- Core Agentic Functions: goal decomposition, self-prompting, API chaining, perception, reasoning/planning, tool use, memory, execution
-- Engineering/Ops: automated debugging, refactoring, IT helpdesk, log analysis, dependency updates, security patching, file create/modify, code execution flow, syntax checks, exception handling/logging, automated testing, environment configuration
-- Research/Intelligence: deep web research, market monitoring, document comparison, sentiment tracking, academic paper synthesis, competitive intelligence, product recommendation, churn prediction
-- Personal Assistance: travel planning, smart-home workflows, financial management, budget optimization, learning tutor
-- Creative/Content: social media management
-- Multi-Agent Collaboration: task handoff, consensus building, resource allocation
-- Quality/Verification: model self-correction
-
-Important behavior notes:
-
-- For simple tasks, only minimal stages run.
-- For medium/hard tasks, the system enables more agents and validation layers.
-- For hard tasks, it can run independent branches in parallel (Graph + Ensemble).
-- For integration-heavy tasks (email/calendar/smart-home/external enterprise APIs), the router still classifies and plans correctly; actual execution depends on available external connectors/APIs.
-
-## What `architecture.py` Contains
-
-`architecture.py` is self-contained and includes:
-
-- settings/env config loading,
-- model pool and fallback behavior,
-- web tooling (search + scrape),
-- persistent memory store,
-- all agent classes,
-- orchestration class,
-- CLI entrypoint.
-
-No additional project code files are required for runtime logic.
-
-## High-Level Flow
-
-This is the **canonical full pipeline**. Runtime may skip stages based on task complexity/profile.
+The following mermaid flow illustrates the canonical end-to-end path (the orchestrator adaptively enables or skips stages):
 
 ```mermaid
 flowchart TD
@@ -178,357 +112,133 @@ flowchart TD
     ESW --> O[Final Answer]
 ```
 
-Stages marked with `*` are adaptively enabled/disabled by `ExecutionProfile`.
-
-## Agent Communication Pattern
-
-All agents communicate via:
-
-- `AgentContext.post(...)` method
-- `ctx.messages` list (raw message objects)
-- `ctx.trace` list (human-readable trace lines)
-- `ctx.blackboard["messages"]` (shared communication feed)
-
-This enables transparent inter-agent signaling and auditable flow traces.
-
-## Core Data Structures
-
-### 1. `Settings`
-
-Holds runtime config:
-
-- model IDs
-- token
-- timeout
-- user-agent
-- memory file path
-
-Loaded from environment via `Settings.from_env()`.
-
-### 2. `AgentContext`
-
-Shared mutable state for one task execution:
-
-- query and route
-- semantic intent analysis and task probabilities
-- plan and steps
-- detected entities and clarification state
-- observations and sources
-- assignments
-- warnings
-- confidence and verification flags
-- blackboard artifacts/status/messages
-- memory recall and semantic/graph artifacts
-- final answer
-- execution trace
-
-### 3. `MemoryStore`
-
-Persistent JSON store (default file: `autobot_memory.json`) with:
-
-- `episodes`: recent task summaries (up to 100)
-- `semantic`: key-value fact memory (up to 400 keys)
-- `graph`: accumulated nodes/edges
-
-## Detailed Agent-by-Agent Behavior
-
-### `IntentParsingAgent`
-
-- Performs semantic intent parsing with structured JSON output.
-- Produces:
-  - `primary_task` and `secondary_tasks`
-  - `task_probabilities` over task taxonomy
-  - entities, urgency, ambiguity score
-  - clarification requirements/questions
-- Uses semantic fallback inference if model output is invalid/unavailable.
-
-### `ExecutionProfile` (Orchestrator Stage)
-
-- Converts semantic intent + probabilities + ambiguity into:
-  - complexity/depth
-  - optional/required stage switches
-  - retry policy and parallel-branch policy
-- Enables clarification mode for ambiguous requests.
-
-### `Clarification Mode` (Orchestrator Branch)
-
-- Triggered when intent ambiguity is high or key task details are missing.
-- Returns targeted clarification questions instead of executing full tool/reasoning flow.
-- Still finalizes output metadata and persists episode context for continuity.
-
-### `MetaControllerAgent`
-
-- Uses semantic intent-analysis outputs (not single keyword rules) to set:
-  - task category
-  - web/tool routing requirements
-  - reasoning/ensemble requirements
-  - verification depth and safety routing flags
-
-### `EpisodicSemanticAgent`
-
-- `recall`: retrieves top related episodes by token overlap.
-- `write`: after finalization, writes episode summary, semantic facts, and graph updates to persistent memory.
-
-### `PlanningAgent`
-
-- Creates numbered plan from user query + route + recalled memory.
-- Stores parsed plan steps into context and blackboard.
-
-### `GoalDecompositionAgent`
-
-- Converts the high-level task into explicit ordered subtasks.
-- Produces sub-goals used by downstream coordination and execution.
-
-### `TreeOfThoughtsAgent`
-
-- Generates 3 candidate thought branches (JSON preferred).
-- Scores branches and selects best.
-- Uses fallback branches if parse fails.
-
-### `CellularAutomataAgent`
-
-- Turns plan steps into weighted cells.
-- Runs local-neighbor update iterations.
-- Produces ranked step priorities for execution emphasis.
-
-### `MultiAgentCoordinator`
-
-- Maps prioritized steps to specialist roles:
-  - `ToolUseAgent`
-  - `ReActAgent`
-  - `PEVAgent`
-  - `EnsembleAgent`
-  - `GraphAgent`
-- Publishes assignments to blackboard and trace.
-
-### `ToolUseAgent`
-
-- Generates focused web search query.
-- Runs web search (up to 5 results).
-- Scrapes top valid URLs (up to 2 pages).
-- Appends evidence to observations and source list.
-- Falls back to original user query if generated query looks invalid.
-
-### `ReActAgent`
-
-- Iterative loop (`max_steps`) with actions: `search`, `scrape`, `note`, `finish`.
-- Expects strict JSON action payload from thinking model.
-- If action parse fails, exits safely with `finish`.
-- Adds every action outcome to observations and trace.
-
-### `BlackboardAgent`
-
-- Consolidates current status:
-  - observation count
-  - deduped source count
-  - message count
-  - current assignments
-- Writes status to `ctx.blackboard["status"]`.
-
-### `GraphAgent`
-
-- Extracts capitalized entities from query and recent observations.
-- Builds lightweight co-occurrence edges.
-- Updates `ctx.graph_memory`.
-
-### `EnsembleAgent`
-
-- Runs three perspectives in parallel conceptually:
-  - `analyst`
-  - `skeptic`
-  - `builder`
-- Stores all views for synthesis input.
-
-### `MentalLoopAgent`
-
-- Simulates execution risk score.
-- Higher risk when evidence is sparse or warnings exist.
-- Stores recommendation (`proceed` or `gather_more_evidence`).
-
-### `DryRunAgent`
-
-- Uses simulation risk + evidence checks to pass/fail dry run.
-- Adds warning if dry run fails.
-
-### `PEVAgent`
-
-- Verifies coverage by comparing plan-step tokens against gathered observations.
-- `verified = coverage >= 0.35 AND dry_run_passed`.
-- If verification is weak and web route is enabled, architecture triggers one additional tool-use + react + verify pass.
-
-### `RLHFAgent`
-
-- Critiques draft answer.
-- Rewrites answer using critique.
-- Improves final quality through self-feedback loop.
-
-### `ReflexiveMetacognitiveAgent`
-
-- Computes confidence score from:
-  - PEV result
-  - dry-run result
-  - number of deduped sources
-- Adds warning if confidence is low/moderate.
-
-## Model Architecture
-
-`HFModelPool` handles model clients and routing:
-
-- `planning` key -> planning model
-- `rag` key -> synthesis model
-- `thinking` key -> reasoning model
-
-### Model fallback behavior
-
-If Hugging Face client or token is unavailable:
-
-- planning returns default 4-step plan,
-- thinking returns a default `finish` ReAct action,
-- rag returns a short synthesized draft from prompt text.
-
-If model API errors occur, it falls back to mock output and embeds an error prefix.
-
-## Tooling and External Calls
-
-### Web search
-
-- Provider: `duckduckgo_search` (`DDGS`)
-- Method: `web_search(query, limit=5)`
-- Returns structured list: `title`, `url`, `snippet`
-
-### Web scraping
-
-- Provider: `requests` + `beautifulsoup4`
-- Method: `web_scrape(url, max_chars=3200)`
-- Cleans `script/style/noscript` and extracts plain text.
-
-### Tool fallback behavior
-
-- Missing `duckduckgo_search`: returns a synthetic "Search unavailable" result.
-- Missing `requests`/`bs4`: returns synthetic "Scrape unavailable" text.
-- Runtime tool exceptions are converted into non-crashing error results.
-
-## Requirements
-
-Python:
-
-- Recommended: Python 3.10+
-
-Install dependencies:
+Stages marked with `*` are adaptively enabled or disabled by the computed `execution_profile`.
+
+## How it works (step-by-step)
+
+1. Recall: `EpisodicSemanticAgent` loads recent episodes (lexical token overlap) into context.
+2. Intent parse: `IntentParsingAgent` requests a structured JSON intent analysis from the reasoning model; a semantic fallback runs if model parsing fails.
+3. Meta-control: `MetaControllerAgent` converts intent probabilities into routing decisions (web usage, verification depth, ensemble, etc.).
+4. Execution profile: the orchestrator scores complexity and selects which agents/stages to run.
+5. Planning & decomposition: `PlanningAgent` produces a numbered plan; `GoalDecompositionAgent` and `TreeOfThoughtsAgent` expand or explore alternatives when required.
+6. Evidence gathering: `ToolUseAgent` and `ReActAgent` gather web evidence and scrape pages; observations and sources populate the blackboard.
+7. Verification: `PEVAgent`, `DryRunAgent`, and `MentalLoopAgent` simulate and verify coverage and risk.
+8. Synthesis: a `rag`-style model synthesizes a grounded, evidence-aware final answer.
+9. Refinement: optional RLHF-style critique+rewrite and reflexive confidence scoring.
+10. Persistence: `EpisodicSemanticAgent.write` persists episodic and semantic facts and updates the graph memory.
+
+## Usage examples
+
+Run a simple query (from the `autobot` folder):
 
 ```bash
-pip install huggingface_hub requests beautifulsoup4 duckduckgo-search
+python architecture.py --query "Summarize recent advances in multi-agent planning and their trade-offs" --show-trace
 ```
 
-## Environment Variables
-
-Required for real model inference:
-
-- `HF_TOKEN`: Hugging Face access token
-
-Optional overrides:
-
-- `PLANNING_MODEL` (default `LiquidAI/LFM2.5-1.2B-Instruct`)
-- `RAG_MODEL` (default `LiquidAI/LFM2-1.2B-RAG`)
-- `THINKING_MODEL` (default `LiquidAI/LFM2.5-1.2B-Thinking`)
-- `AUTOBOT_USER_AGENT` (default `autobot-architecture/1.0`)
-- `REQUEST_TIMEOUT` (default `45`)
-- `AUTOBOT_MEMORY_FILE` (default `autobot_memory.json`)
-
-PowerShell example:
-
-```powershell
-$env:HF_TOKEN="your_token"
-$env:PLANNING_MODEL="LiquidAI/LFM2.5-1.2B-Instruct"
-$env:RAG_MODEL="LiquidAI/LFM2-1.2B-RAG"
-$env:THINKING_MODEL="LiquidAI/LFM2.5-1.2B-Thinking"
-```
-
-## CLI Usage
-
-Run from `autobot` folder:
+Increase ReAct iterations for deeper exploration:
 
 ```bash
-python architecture.py --query "Your task here"
+python architecture.py --query "Investigate best practices for building a PEV loop" --max-steps 6 --show-trace
 ```
 
-With options:
+### Example input
+
+Query (CLI):
+
+"Create a 3-step plan to extract data from a web page, validate it, and produce a short report. Include assumptions."
+
+### Example output (truncated)
+
+=== FINAL ANSWER ===
+
+Plan:
+1. Extract key fields from target pages.
+2. Validate extracted fields with cross-checks.
+3. Synthesize a short report listing assumptions and sources.
+
+Draft answer: The agent collected evidence from 2 web pages and validated X data points. Assumptions: no JS-heavy content, pages accessible. Sources:
+1. Example Site - https://example.com/page
+
+---
+Task category: data_gathering
+Primary task: data_gathering
+Secondary tasks: verification, analysis
+Complexity: medium
+Depth: medium
+Intent tags: data_gathering, verification
+Detected capabilities: Tool Use, Deep Web Research
+Urgency: medium
+Ambiguity score: 0.120
+Requires clarification: False
+Confidence: 0.63
+PEV verified: True
+Dry-run passed: True
+Executed stages: 12
+Skipped stages: 3
+
+> Note: actual output includes full `execution_profile`, `intent_analysis`, and optional `AGENT COMMUNICATION TRACE` when `--show-trace` is passed.
+
+## Input/Output expectations & tips
+
+- Provide explicit objectives and constraints in your query for best routing.
+- If the task depends on non-public data or local files, the agent currently cannot access local files unless you extend the code with connectors.
+- Increase `--max-steps` for more exploration but expect longer runtimes and more API calls.
+
+## Code review — key findings (quick)
+
+- Good design: clear, modular agent classes, single `AgentContext` shared state, and robust orchestrator with replan logic.
+- Fallbacks: the `HFModelPool._mock` and fallback inference ensure the system fails soft when model access is unavailable.
+
+Suggested improvements and risks:
+
+1. Model I/O validation: add JSON schema validation for all model outputs (`IntentParsingAgent`, `ReActAgent`, `TreeOfThoughtsAgent`) to avoid silent parsing errors.
+2. Memory recall: current recall uses token overlap; moving to vector embeddings (FAISS or similar) will improve retrieval relevance.
+3. Entity extraction: uses a simple regex; consider NER (spaCy or model-based) for higher-quality graph construction.
+4. Concurrency safety: shared `ctx` is mutated from parallel threads (`_run_parallel_group`); ensure no race conditions when multiple threads modify `ctx.blackboard` or lists—consider thread locks or copy-on-write patterns for shared artifacts.
+5. HF client usage: `InferenceClient.chat_completion` may differ across HF SDK versions—add adaptors and tests to validate response shape.
+6. MemoryStore.save currently raises on write failure; consider a retry/backoff and not raising to avoid crashing the orchestrator in production.
+7. Add structured unit and integration tests that mock model clients and tools to validate branching logic.
+
+## Recommended next steps (minimal)
+
+1. Add JSON schema checks for model outputs and fail gracefully with helpful debug messages.
+2. Integrate an embedding-based recall (optional: FAISS + sentence-transformers) and add a feature flag.
+3. Add a small test harness that runs `architecture.py` in mock mode (no HF token) with deterministic model mocks.
+
+## Environment variables
+
+- `HF_TOKEN` (required for real model calls)
+- `PLANNING_MODEL`, `RAG_MODEL`, `THINKING_MODEL` (optional overrides)
+- `AUTOBOT_USER_AGENT`, `REQUEST_TIMEOUT`, `AUTOBOT_MEMORY_FILE`
+
+## Quick verification
+
+Run:
 
 ```bash
-python architecture.py --query "Your task here" --max-steps 6 --show-trace
+python architecture.py --query "Explain your architecture and show latest AI agent trends" --show-trace
 ```
 
-### CLI arguments
+Expected checks:
 
-- `--query` (required): user task text.
-- `--max-steps` (optional): maximum ReAct iterations. Default `4`.
-- `--show-trace` (optional flag): prints inter-agent communication trace.
+- `execution_profile` printed
+- `intent_analysis` printed
+- `autobot_memory.json` updated with an episode after run
 
-CLI also prints:
+## Where to go from here
 
-- selected `execution_profile` (what stages were chosen),
-- full `intent_analysis` (primary/secondary tasks + probabilities + ambiguity),
-- executed stages list,
-- skipped stages list.
+- Add unit tests for each Agent class and the orchestrator branches.
+- Replace lexical recall with vector recall for better personalization.
+- Add observability (structured logs, traces) and optionally export to LangSmith or other tracing platforms.
 
-## Input Expectations
+---
 
-1. Query text must be meaningful and specific.
-2. For best routing accuracy, include objective, scope, and constraints (semantic parser uses full intent, not only exact keywords).
-3. For deeper iterative exploration, raise `--max-steps`.
-4. For reproducible runs, keep stable model IDs and memory file path.
+File: `autobot/architecture.py`
 
-## Output Expectations
+If you want, I can now:
 
-Program prints:
+- apply a small change to add JSON schema validation scaffolding, or
+- scaffold a test harness that runs `architecture.py` in mock mode and asserts high-level outputs.
 
-1. `=== FINAL ANSWER ===` section.
-2. optional `=== AGENT COMMUNICATION TRACE ===` when `--show-trace` is passed.
-3. `=== EXECUTION PROFILE ===` and `=== INTENT ANALYSIS ===` sections.
-4. optional capability/subtask/clarification sections when available.
+Which would you prefer next?
 
-Final answer always appends metadata block:
-
-- `Primary task` and `Secondary tasks`
-- `Ambiguity score` and `Requires clarification`
-- `Confidence: <0.0-1.0>`
-- `PEV verified: <true|false>`
-- `Dry-run passed: <true|false>`
-- deduped `Sources` (up to 8)
-- `Warnings` (if present, up to 5)
-
-## Execution Guarantees and Safety Notes
-
-- The architecture is fail-soft: missing packages or API failures degrade behavior instead of hard-crashing core flow.
-- Dry-run + PEV + metacognitive checks enforce quality gates before output finalization.
-- Output confidence is heuristic, not a formal probability calibration.
-- Web-derived content quality depends on external pages and search rankings.
-
-## Known Limitations
-
-1. Intent parsing quality depends on model availability/quality; fallback is semantic scoring (stronger than keyword-if rules, but still lighter than full embedding models).
-2. Graph extraction is lightweight and surface-form based.
-3. Episodic recall uses token overlap, not embedding similarity.
-4. Tool execution is synchronous and limited to selected sources.
-5. Confidence computation is rule-based, not statistically calibrated.
-
-## Recommended Improvements
-
-1. Replace lexical memory recall with vector similarity.
-2. Add robust URL/domain filtering and source quality scoring.
-3. Add JSON schema enforcement for all model outputs.
-4. Add async tool execution and retry/backoff strategy.
-5. Add unit/integration tests for each agent and flow branch.
-6. Add persistent blackboard snapshots for observability dashboards.
-
-## Quick Verification Checklist
-
-1. `python architecture.py --query "Explain your architecture and show latest AI agent trends" --show-trace`
-2. Confirm executed/skipped stages match the selected execution profile.
-3. Confirm final answer includes confidence + PEV + dry-run metadata.
-4. Confirm `autobot_memory.json` is created/updated.
-
-## File Map
-
-- Main runtime: `autobot/architecture.py`
-- This documentation: `autobot/README.md`
