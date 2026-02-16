@@ -37,8 +37,12 @@ This document explains the content, flow, failure modes, inputs/outputs, and des
 9. `EpisodicSemanticAgent` writes memory; orchestration returns `AgentContext` with `final_answer` and artifacts.
 
 **Mermaid flowchart**
+## Flowchart (Mermaid)
+
+The following mermaid flow illustrates the canonical end-to-end path (the orchestrator adaptively enables or skips stages):
 
 ```mermaid
+flowchart TD
 flowchart TD
   User[User Query]
   Intent[IntentParsingAgent]\n(parse -> JSON)
@@ -267,3 +271,4 @@ Notes on safety and personality:
 ---
 
 If you want, I can expand these examples into unit tests (input → expected ctx state and final_answer assertions) or add canned safety templates for emotion responses. Which would you like next?
+
